@@ -3,21 +3,18 @@ matplotlib.use("TkAgg")
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, welch
+from scipy.signal import butter, filtfilt, welch, lfilter
 
-# ------------------------------------------------
+
 # Parameters
-# ------------------------------------------------
 baud = 80_000
 sps = 20  # samples per symbol
 fs = baud * sps
-num_symbols = int(baud * 8 * 1e-3)   
-spp = int(sps*1.0)  # samples per pulse
+num_symbols = int(baud * 16 * 1e-3)   
+spp = int(sps*0.8)  # samples per pulse
 noise_sigma=0.2
 
-# ------------------------------------------------
-# Generate PAM4 signal
-# ------------------------------------------------
+# PAM4 signal
 levels = np.array([-3, -1, 1, 3])
 
 data = levels[np.random.randint(0, len(levels), num_symbols)]
@@ -25,26 +22,29 @@ data = levels[np.random.randint(0, len(levels), num_symbols)]
 tx = np.zeros(num_symbols * sps)
 tx[::sps] = data
 
-pulse0 = 0.5 * (1 - np.cos(2*np.pi/spp*np.arange(spp)))
 
+# plase pulse0 within pulse
+pulse0 = 0.5 * (1 - np.cos(2*np.pi/spp*np.arange(spp)))
 wings = int((sps - spp) / 2)
 pulse = np.zeros(sps)
 pulse[wings:wings+len(pulse0)] = pulse0
 
 signal = np.convolve(tx, pulse, mode="same")
 
-rx = signal + np.random.normal(0, noise_sigma, len(signal))
+# limited channel bandwidth
+b, a = butter(5, 0.0663)   
+rx = lfilter(b, a, signal)
 
-# ------------------------------------------------
-# Matched filter
-# ------------------------------------------------
+# AWGN
+rx += np.random.normal(0, noise_sigma, len(rx))
+
+
+# Matched filter on the recv'd signal
 matched = pulse[::-1]
 rx_mf = np.convolve(rx, matched, mode="same")
 
-# ------------------------------------------------
-# Create baud-rate spectral line
-# ------------------------------------------------
 
+# find baud-rate spectral line
 def bandpass(low, high, fs, order=4):
     b, a = butter(order, [low/(fs/2), high/(fs/2)], btype='bandpass')
     return b, a
@@ -88,9 +88,17 @@ for n in range(len(tone)):
     freq_est[n] = (freq + control) * fs / (2*np.pi)
     nco[n] = -np.cos(phase)
 
-# ------------------------------------------------
-# Spectrum view
-# ------------------------------------------------
+
+# recv'd vs transmit
+plt.figure()
+plt.plot(rx[-10000:], 'b-', label="recv'd")
+plt.plot(rx_mf[-10000:], 'g-', label="matched filter output")
+plt.plot(signal[-10000:], 'r-', label="transmit")
+plt.legend()
+
+
+
+# baud tone view
 seg = 2<<11
 
 f1, P1 = welch(rx, fs, nperseg=seg)
@@ -106,18 +114,12 @@ noise_power = np.mean(P2[noise_bins])
 btnr = 10*np.log10(tone_power / noise_power)
 
 plt.figure()
-plt.plot(rx[-10000:], 'b-', label="data")
-plt.plot(rx_mf[-10000:], 'g-', label="matched filter output")
-plt.plot(signal[-10000:], 'r-', label="transmit")
-plt.legend()
-
-plt.figure()
 plt.plot(pulse, 'r.')
 
 plt.figure(figsize=(10,6))
-plt.semilogy(f1, P1, label="Original signal")
-plt.semilogy(f2, P2, label="After squaring")
-plt.semilogy(f3, P3, label="After bandpass")
+plt.semilogy(f1, P1, label="recv'd signal")
+plt.semilogy(f2, P2, label="mfilter&sq...")
+plt.semilogy(f3, P3, label="...bandpass")
 plt.xlim(0, 4*baud)
 
 plt.axvline(baud, color='r', linestyle='--')
@@ -147,19 +149,18 @@ plt.plot(nco, label="PLL clock")
 plt.legend()
 plt.title("PLL Locking to Baud Tone")
 
-# ------------------------------------------------
+
 # Sampling phase detection
-# ------------------------------------------------
 phases = np.arange(sps)
 metric = np.zeros(sps)
 
 for p in phases:
 
-    samples = rx_mf[p::sps]
-    samples = samples[:num_symbols]
+    samples = rx_mf[p::sps][:num_symbols]
 
-    metric[p] = np.var(samples)
-
+    #metric[p] = np.var(samples)
+    metric[p] = np.mean(np.abs(samples))
+    
 best_phase = np.argmax(metric)
 
 print("Best sampling phase:", best_phase)
@@ -169,21 +170,24 @@ plt.plot(phases, metric, 'o-')
 plt.axvline(best_phase, color='r', linestyle='--')
 plt.title("Eye Opening Metric vs Sampling Phase")
 plt.xlabel("Sample Offset")
-plt.ylabel("Variance")
+plt.ylabel("metric")
 
-# ------------------------------------------------
-# Eye Diagram
-# ------------------------------------------------
+
+
+# Eye Diagram 
+
+# diagram is eye_symbols wide
 eye_symbols = 2
 eye_samples = eye_symbols * sps
 
+# make a matrix out of stacked symbols, sps wide
+usable = (len(rx_mf) // sps) * sps
+reshaped = rx_mf[:usable].reshape(-1, sps)
+
 plt.figure(figsize=(9,5))
 
-for i in range(num_symbols - eye_symbols):
-
-    start = i * sps
-    segment = rx_mf[start:start + eye_samples]
-
+for i in range(len(reshaped)-eye_symbols):
+    segment = reshaped[i:i+eye_symbols].flatten()
     t = np.arange(eye_samples) / sps
     plt.plot(t, segment, color='blue', alpha=0.05)
 
@@ -195,16 +199,9 @@ plt.ylabel("Amplitude")
 plt.grid(True)
 plt.legend()
 
-# ------------------------------------------------
-# Symbol Sampling
-# ------------------------------------------------
-
-samples = rx_mf[best_phase::sps][:num_symbols]
 
 
-# ------------------------------------------------
 # Adaptive Symbol Slicing for PAM4
-# ------------------------------------------------
 
 # Sample the matched filter output at the best phase
 samples = rx_mf[best_phase::sps][:num_symbols]
@@ -237,14 +234,12 @@ plt.plot(sliced[:500], 'r.', label="Sliced")
 plt.title("Symbol Slicing with Adaptive Levels")
 plt.xlabel("Symbol Index")
 plt.ylabel("Amplitude")
-plt.legend()
+
 plt.grid(True)
 
 
-# ------------------------------------------------
-# Constellation
-# ------------------------------------------------
 
+# Constellation
 plt.figure(figsize=(6,6))
 
 plt.plot(samples, np.zeros_like(samples), '.', alpha=0.3)
@@ -258,42 +253,49 @@ plt.ylabel("Quadrature (unused)")
 plt.ylim(-0.5,0.5)
 plt.grid(True)
 
-# ------------------------------------------------
+
+
 # Symbol Error Rate
-# ------------------------------------------------
 
+# map TX levels to indices
+level_map = { -3:0, -1:1, 1:2, 3:3 }
+tx_idx = np.array([level_map[v] for v in data[:len(samples)]])
 
+# determine RX symbol indices using thresholds
+rx_idx = np.zeros(len(samples), dtype=int)
 
-# Transmitted symbols (aligned to recovered samples)
-tx_symbols = data[:len(sliced)]
+rx_idx[samples < thresholds[0]] = 0
+rx_idx[(samples >= thresholds[0]) & (samples < thresholds[1])] = 1
+rx_idx[(samples >= thresholds[1]) & (samples < thresholds[2])] = 2
+rx_idx[samples >= thresholds[2]] = 3
 
-# Scale recovered symbols to match tx amplitude
-scale = np.std(sliced) / np.std(tx_symbols)
-sliced_scaled = sliced / scale
-
-# Compute minimum spacing between PAM levels
-unique_levels = np.sort(np.unique(tx_symbols))
-min_spacing = np.min(np.diff(unique_levels))
-
-# Set tolerance as half the minimum spacing
-tol = min_spacing / 2
-
-# Compute error vector: 1 = error, 0 = correct
-error_vector = (np.abs(sliced_scaled - tx_symbols) > tol).astype(int)
-
-# Symbol error rate
+# compute errors
+error_vector = (tx_idx != rx_idx)
 ser = np.mean(error_vector)
 
-print("Minimum PAM spacing:", min_spacing)
-print("Tolerance used for error detection:", tol)
-print("Symbol error rate:", ser)
+print("Symbol error rate:", ser, np.sum(error_vector), len(error_vector))
 
 
-plt.figure()
-plt.plot(error_vector, '.', markersize=2)
-plt.title("Symbol Error Vector")
-plt.xlabel("Symbol Index")
-plt.ylabel("Error (1=yes, 0=no)")
-plt.show()
+
+# PAM4 Histogram and Decision Thresholds
+plt.figure(figsize=(8,5))
+
+plt.hist(samples, bins=100, density=True, alpha=0.7, color='steelblue')
+
+# plot estimated levels
+for lvl in levels_rx:
+    plt.axvline(lvl, color='green', linestyle='--', linewidth=2)
+
+# plot decision thresholds
+for th in thresholds:
+    plt.axvline(th, color='red', linestyle='-', linewidth=2)
+
+plt.title("PAM4 Sample Histogram")
+plt.xlabel("Amplitude")
+plt.ylabel("Probability Density")
+plt.grid(True)
+
+plt.legend(["Estimated Levels", "Decision Thresholds"])
+
 
 plt.show()
