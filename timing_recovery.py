@@ -10,7 +10,9 @@ from scipy.signal import butter, filtfilt, welch, lfilter
 baud = 80_000
 sps = 20  # samples per symbol
 fs = baud * sps
-num_symbols = int(baud * 16 * 1e-3)   
+num_symbols = int(baud * 40 * 1e-3)
+print ("num symbols ",num_symbols)
+
 spp = int(sps*0.8)  # samples per pulse
 noise_sigma=0.2
 
@@ -23,7 +25,7 @@ tx = np.zeros(num_symbols * sps)
 tx[::sps] = data
 
 
-# plase pulse0 within pulse
+# place pulse0 within pulse
 pulse0 = 0.5 * (1 - np.cos(2*np.pi/spp*np.arange(spp)))
 wings = int((sps - spp) / 2)
 pulse = np.zeros(sps)
@@ -32,8 +34,10 @@ pulse[wings:wings+len(pulse0)] = pulse0
 signal = np.convolve(tx, pulse, mode="same")
 
 # limited channel bandwidth
-b, a = butter(5, 0.0663)   
+b, a = butter(5, 0.176)   
 rx = lfilter(b, a, signal)
+#rx=signal
+
 
 # AWGN
 rx += np.random.normal(0, noise_sigma, len(rx))
@@ -42,6 +46,34 @@ rx += np.random.normal(0, noise_sigma, len(rx))
 # Matched filter on the recv'd signal
 matched = pulse[::-1]
 rx_mf = np.convolve(rx, matched, mode="same")
+
+#####################
+# equalizer
+eq_taps = 7
+mu = 0.001
+rx_eq = np.zeros_like(rx_mf)
+eq = np.zeros(eq_taps)
+eq[eq_taps // 2] = 1.0  # identity initialization
+
+# Upsample data and pulse-shape to match MF output
+tx_upsampled = np.zeros(len(data)*sps)
+tx_upsampled[::sps] = data
+
+desired = np.convolve(tx_upsampled, pulse, mode="same")
+desired = np.convolve(desired, matched, mode="same")
+
+for n in range(eq_taps, len(rx_mf)):
+    x = rx_mf[n-eq_taps+1:n+1][::-1]
+    y = np.dot(eq, x)
+    e = desired[n] - y
+    if np.isnan(e) or np.isnan(x).any():  # skip invalid updates
+        rx_eq[n] = y
+        continue
+    eq += mu * e * x
+    rx_eq[n] = y
+    
+# Now rx_eq can replace rx_mf for sampling and slicing
+rx_mf=rx_eq
 
 
 # find baud-rate spectral line
@@ -57,9 +89,9 @@ tone = filtfilt(b, a, sq)
 
 tone = tone / np.std(tone)
 
-# ------------------------------------------------
-# Digital PLL
-# ------------------------------------------------
+###########################
+# PLL
+
 phase = 0
 freq = 2*np.pi*baud/fs*1.04
 integrator = 0
@@ -91,16 +123,17 @@ for n in range(len(tone)):
 #################
 #pulse shape
 
-plt.figure()
+plt.figure(figsize=(4,2))
 plt.plot(pulse, 'r.')
 
 ########################3
-# recv'd vs transmit
+# recv'd vs transmit (last 10000)
 
 plt.figure(figsize=(20,4))
 plt.plot(rx[-10000:], 'b-', label="recv'd")
 plt.plot(rx_mf[-10000:], 'g-', label="matched filter output")
 plt.plot(signal[-10000:], 'r-', label="transmit")
+plt.title("recv'd vs transmit (last 10000)")
 plt.legend()
 
 
@@ -214,7 +247,6 @@ for i in range(len(reshaped)-eye_symbols):
 
 plt.axvline(best_phase/sps, color='red', linestyle='--', linewidth=2, label="Best Sample")
 
-plt.title("Eye Diagram")
 plt.xlabel("Symbol Time")
 plt.ylabel("Amplitude")
 plt.grid(True)
@@ -227,17 +259,16 @@ plt.legend()
 # Sample the matched filter output at the best phase
 samples = rx_mf[best_phase::sps][:num_symbols]
 
-# Estimate PAM4 levels from samples
-sorted_samples = np.sort(samples)
-N = len(samples)
+# Estimate PAM4 levels using KMeans clustering
+from sklearn.cluster import KMeans
+init = np.array([-3, -1, 1, 3]).reshape(-1,1)
+kmeans = KMeans(n_clusters=4, init=init, n_init=1, random_state=0)
+kmeans.fit(samples.reshape(-1,1))
 
-lvl1 = np.mean(sorted_samples[:N//4])
-lvl2 = np.mean(sorted_samples[N//4:N//2])
-lvl3 = np.mean(sorted_samples[N//2:3*N//4])
-lvl4 = np.mean(sorted_samples[3*N//4:])
-levels_rx = np.array([lvl1, lvl2, lvl3, lvl4])
+# Extract and sort cluster centers
+levels_rx = np.sort(kmeans.cluster_centers_.flatten())
 
-# Compute decision thresholds (midpoints between levels)
+# Compute decision thresholds
 thresholds = (levels_rx[:-1] + levels_rx[1:]) / 2
 
 # Slice the symbols based on thresholds
@@ -250,9 +281,9 @@ sliced[samples >= thresholds[2]] = levels_rx[3]
 
 
 plt.figure()
-plt.plot(samples[:500], '.', label="Samples")
-plt.plot(sliced[:500], 'r.', label="Sliced")
-plt.title("Symbol Slicing with Adaptive Levels")
+plt.plot(samples[-10000:], '.', label="Samples")
+plt.plot(sliced[-10000:], 'r.', label="Sliced")
+plt.title("Symbol Slicing (last 10000)")
 plt.xlabel("Symbol Index")
 plt.ylabel("Amplitude")
 
@@ -292,8 +323,13 @@ rx_idx[(samples >= thresholds[1]) & (samples < thresholds[2])] = 2
 rx_idx[samples >= thresholds[2]] = 3
 
 # compute errors
-error_vector = (tx_idx != rx_idx)
+discard_symbols = 200
+tx_valid = tx_idx[discard_symbols:]
+rx_valid = rx_idx[discard_symbols:]
+
+error_vector = (tx_valid != rx_valid)
 ser = np.mean(error_vector)
+
 
 print("Symbol error rate:", ser, np.sum(error_vector), len(error_vector))
 
@@ -311,7 +347,7 @@ for lvl in levels_rx:
 # plot decision thresholds
 for th in thresholds:
     plt.axvline(th, color='red', linestyle='-', linewidth=2)
-
+    
 plt.title("PAM4 Sample Histogram")
 plt.xlabel("Amplitude")
 plt.ylabel("Probability Density")
