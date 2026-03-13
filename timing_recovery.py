@@ -88,9 +88,16 @@ for n in range(len(tone)):
     freq_est[n] = (freq + control) * fs / (2*np.pi)
     nco[n] = -np.cos(phase)
 
+#################
+#pulse shape
 
-# recv'd vs transmit
 plt.figure()
+plt.plot(pulse, 'r.')
+
+########################3
+# recv'd vs transmit
+
+plt.figure(figsize=(20,4))
 plt.plot(rx[-10000:], 'b-', label="recv'd")
 plt.plot(rx_mf[-10000:], 'g-', label="matched filter output")
 plt.plot(signal[-10000:], 'r-', label="transmit")
@@ -98,7 +105,9 @@ plt.legend()
 
 
 
+######################
 # baud tone view
+
 seg = 2<<11
 
 f1, P1 = welch(rx, fs, nperseg=seg)
@@ -113,10 +122,8 @@ noise_power = np.mean(P2[noise_bins])
 
 btnr = 10*np.log10(tone_power / noise_power)
 
-plt.figure()
-plt.plot(pulse, 'r.')
 
-plt.figure(figsize=(10,6))
+plt.figure(figsize=(20,5))
 plt.semilogy(f1, P1, label="recv'd signal")
 plt.semilogy(f2, P2, label="mfilter&sq...")
 plt.semilogy(f3, P3, label="...bandpass")
@@ -126,31 +133,45 @@ plt.axvline(baud, color='r', linestyle='--')
 plt.text(baud*1.1, max(P2), f"BTNR = {btnr:.1f} dB")
 
 plt.legend()
-plt.title("Spectral Line Creation")
+plt.title("Baud tone")
 
-# ------------------------------------------------
+#################
 # PLL diagnostics
-# ------------------------------------------------
-plt.figure()
-plt.plot(phase_error)
-plt.title("PLL Phase Detector Output")
-plt.xlabel("Sample")
 
-plt.figure()
-plt.plot(freq_est)
-plt.axhline(baud, color='r', linestyle='--')
-plt.title("PLL Frequency Estimate")
-plt.xlabel("Sample")
-plt.ylabel("Frequency (Hz)")
+fig, axs = plt.subplots(3, 1, figsize=(20, 8), sharex=True, gridspec_kw={'height_ratios':[1,1,1]})
 
-plt.figure()
-plt.plot(tone, label="Recovered tone")
-plt.plot(nco, label="PLL clock")
-plt.legend()
-plt.title("PLL Locking to Baud Tone")
+# Phase Detector Output
+axs[0].plot(phase_error, label="Phase Error", color='tab:blue')
+axs[0].set_ylabel("Phase Error")
+axs[0].legend(loc='upper right')
+axs[0].grid(True)
+
+# Frequency Estimate
+axs[1].plot(freq_est, label="Frequency Estimate", color='tab:orange')
+axs[1].axhline(baud, color='r', linestyle='--', label="Baud Rate")
+axs[1].set_ylabel("Frequency (Hz)")
+axs[1].legend(loc='upper right')
+axs[1].grid(True)
+
+# PLL Locking to Baud Tone
+axs[2].plot(tone, label="Recovered Tone", color='tab:green')
+axs[2].plot(nco, label="PLL Clock", color='tab:red', linestyle='solid')
+axs[2].set_xlabel("Sample")
+axs[2].set_ylabel("Amplitude")
+axs[2].legend(loc='upper right')
+axs[2].grid(True)
+
+# Overall figure title
+fig.suptitle("PLL Diagnostics", fontsize=16)
+
+# Adjust layout so titles/labels don't overlap
+fig.tight_layout(rect=[0, 0, 1, 0.96])
 
 
+
+############################
 # Sampling phase detection
+
 phases = np.arange(sps)
 metric = np.zeros(sps)
 
@@ -173,7 +194,7 @@ plt.xlabel("Sample Offset")
 plt.ylabel("metric")
 
 
-
+#####################
 # Eye Diagram 
 
 # diagram is eye_symbols wide
@@ -184,7 +205,7 @@ eye_samples = eye_symbols * sps
 usable = (len(rx_mf) // sps) * sps
 reshaped = rx_mf[:usable].reshape(-1, sps)
 
-plt.figure(figsize=(9,5))
+plt.figure(figsize=(20,5))
 
 for i in range(len(reshaped)-eye_symbols):
     segment = reshaped[i:i+eye_symbols].flatten()
@@ -200,7 +221,7 @@ plt.grid(True)
 plt.legend()
 
 
-
+#####################################
 # Adaptive Symbol Slicing for PAM4
 
 # Sample the matched filter output at the best phase
@@ -238,8 +259,9 @@ plt.ylabel("Amplitude")
 plt.grid(True)
 
 
-
+#########################
 # Constellation
+
 plt.figure(figsize=(6,6))
 
 plt.plot(samples, np.zeros_like(samples), '.', alpha=0.3)
@@ -254,7 +276,7 @@ plt.ylim(-0.5,0.5)
 plt.grid(True)
 
 
-
+#########################
 # Symbol Error Rate
 
 # map TX levels to indices
@@ -276,7 +298,7 @@ ser = np.mean(error_vector)
 print("Symbol error rate:", ser, np.sum(error_vector), len(error_vector))
 
 
-
+############################################
 # PAM4 Histogram and Decision Thresholds
 plt.figure(figsize=(8,5))
 
