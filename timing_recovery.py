@@ -7,24 +7,23 @@ from scipy.signal import butter, filtfilt, welch, lfilter
 
 # Parameters
 baud = 80_000
-sps = 30  # samples per symbol
+channel_bandwidth =68_000
+sps = 20  # samples per symbol
 fs = baud * sps
-pulse_width_ratio=.5
+nyq=fs/2
+pulse_width_ratio=.3
+spp = int(sps*pulse_width_ratio)  # samples per pulse
 noise_sigma=0.2
-channel_bandwidth =.118
 num_symbols = int(baud * 50 * 1e-3)
+eye_symbols = 4
+
 discard_symbols = int(0.1 * num_symbols)
-pulse_tw = sps/2*pulse_width_ratio/fs*1e3   # approx FWHM
-pulse_fw = 1/pulse_tw
 
 print ("sample rate[khz]", fs/1e3)
-print ("pulse width ",end='')
-print (f"time[ms] {pulse_tw} freq[khz] {pulse_fw}")
-print ("ch_bw[khz]", channel_bandwidth*baud * sps/1e3)
+print ("ch_bw[khz]", channel_bandwidth/1e3)
 print ("discard symbols ", discard_symbols)
 print ("num symbols ",num_symbols)
-
-spp = int(sps*pulse_width_ratio)  # samples per pulse
+print ("===============")
 
 print ("create PAM4 signal")
 
@@ -34,16 +33,180 @@ data = levels[np.random.randint(0, len(levels), num_symbols)]
 tx = np.zeros(num_symbols * sps)
 tx[::sps] = data
 
-# place pulse0 within pulse
-pulse0 = 0.5 * (1 - np.cos(2*np.pi/spp*np.arange(spp)))
-wings = int((sps - spp) / 2)
-pulse = np.zeros(sps)
-pulse[wings:wings+len(pulse0)] = pulse0
+def rcos_shape(sps,spp):
+    
+
+    # place pulse0 within pulse
+    pulse0 = 0.5 * (1 - np.cos(2*np.pi/spp*np.arange(spp)))
+    wings = int((sps - spp) / 2)
+    pulse = np.zeros(sps)
+    pulse[wings:wings+len(pulse0)] = pulse0
+    pulse/=np.max(pulse)
+    return pulse
+
+def gaussian_shape(sps,spp):
+    
+    sigma = spp / 2.355
+    pulse = np.exp(-0.5 * ((np.arange(sps) - (sps-1)/2) / sigma)**2)
+    pulse /= np.max(pulse)
+
+    return pulse
+
+
+def bandpass(low, high, nyq, order=4):
+
+    b, a = butter(order, [low/nyq, high/nyq], btype='bandpass')
+    return b, a
+
+
+def lms_equalizer(rx_mf, desired, eq_taps=5, mu=1e-3, sps=20, best_phase=0):
+    """
+    Symbol-spaced LMS equalizer.
+
+    Parameters:
+        rx_mf    : matched-filtered received signal (array)
+        desired  : reference signal (array, pulse-shaped + matched filter)
+        eq_taps  : number of equalizer taps
+        mu       : step size (LMS gain)
+        sps      : samples per symbol
+        best_phase : symbol sampling offset (0..sps-1)
+
+    Returns:
+        rx_eq : equalized output
+        eq    : final equalizer coefficients
+    """
+    rx_eq = np.zeros_like(rx_mf)
+    eq = np.zeros(eq_taps)
+    eq[eq_taps // 2] = 1.0  # identity init
+
+    for n in range(eq_taps, len(rx_mf)):
+        x = rx_mf[n-eq_taps+1:n+1][::-1]
+        y = eq @ x
+
+        # --- update only at symbol centers ---
+        if (n - best_phase) % sps == 0:
+            e = desired[n] - y
+
+            eq += mu * e * x / (np.dot(x, x) + 1e-12)  # NLMS update
+
+        rx_eq[n] = y
+
+    return rx_eq, eq
+
+
+def rls_equalizer(rx_mf, desired, eq_taps=7, lambda_=0.999, delta=50., sps=20, best_phase=0):
+    """
+    Symbol-spaced RLS equalizer.
+
+    Parameters:
+        rx_mf    : matched-filtered received signal
+        desired  : reference signal (pulse-shaped + matched filter)
+        eq_taps  : number of equalizer taps
+        lambda_  : forgetting factor (0 < lambda_ <= 1)
+        delta    : initial inverse correlation scaling
+        sps      : samples per symbol
+        best_phase : symbol sampling offset (0..sps-1)
+
+    Returns:
+        rx_eq : equalized output
+        eq    : final equalizer coefficients
+    """
+    eq = np.zeros(eq_taps)
+    eq[eq_taps // 2] = 1.0           # identity init
+    rx_eq = np.zeros_like(rx_mf)
+    P = np.eye(eq_taps) * delta       # inverse correlation matrix
+
+    for n in range(eq_taps, len(rx_mf)):
+
+        x = rx_mf[n-eq_taps+1:n+1][::-1]
+        y = eq @ x
+
+        # --- update only at symbol centers ---
+        if (n - best_phase) % sps == 0:
+            e = desired[n] - y
+
+            Px = P @ x
+            K = Px / (lambda_ + x @ Px)
+            eq = eq + K * e
+            P = (P - np.outer(K, Px)) / lambda_
+
+        rx_eq[n] = y
+
+    return rx_eq, eq
+
+#pulse= rcos_shape(sps,spp)
+pulse= gaussian_shape(sps,spp)
+
+print ("plot the pulse shape")
+# ----- TIME AXIS -----
+t = np.arange(len(pulse)) / fs 
+
+# ----- FFT -----
+Nfft = 2<<12
+P = np.fft.fft(pulse, Nfft)
+f = np.fft.fftfreq(Nfft, d=1/fs)
+
+# Positive freqs
+P = np.abs(P[:Nfft//2])
+f = f[:Nfft//2]
+
+# Normalize
+P = P / np.max(P)
+P_db = 20 * np.log10(P + 1e-12)
+
+# -3 dB bandwidth
+peak_idx = np.argmax(P)
+half_power = P[peak_idx] / np.sqrt(2)
+
+indices = np.where(P >= half_power)[0]
+bw_3db = (f[indices[-1]] - f[indices[0]])
+
+
+#print(f"-3 dB bandwidth ≈ {bw_3db/1e3:.2f} khz ")
+
+# time-domain -3 dB (FWHM) 
+half_power = 0.707  # -3 dB in amplitude
+
+indices = np.where(pulse >= half_power * np.max(pulse))[0]
+
+t_left = t[indices[0]]
+t_right = t[indices[-1]]
+fwhm = t_right - t_left
+
+#print(f"FWHM ≈ {fwhm*1e6:.2f} us ")
+
+
+plt.figure(figsize=(10,4))
+plt.subplot(1,2,1)
+plt.plot(t*1e6, pulse, label="Pulse")
+plt.axhline(half_power * np.max(pulse), color='red', linestyle='--', label='-3 dB level')
+plt.axvline(t_left, color='green', linestyle='--')
+plt.axvline(t_right, color='green', linestyle='--', label=f'FWHM ≈ {fwhm*1e6:.3f} us')
+plt.title("Pulse (Time Domain)")
+plt.xlabel("Time (us)")
+plt.ylabel("Amplitude")
+plt.grid()
+plt.legend()
+
+plt.subplot(1,2,2)
+plt.plot(f/1e3, P_db, label="Spectrum")
+plt.axhline(-3, color='red', linestyle='--', label='-3 dB')
+plt.axvline(bw_3db/1e3, color='green', linestyle='--', label=f'BW ≈ {bw_3db/1e3:.1f} kHz')
+plt.title("Pulse Spectrum")
+plt.xlabel("Frequency (kHz)")
+plt.ylabel("Magnitude (dB)")
+plt.grid()
+plt.legend()
+
+plt.tight_layout()
+
+
+
 
 signal = np.convolve(tx, pulse, mode="same")
 
 # limit channel bandwidth
-b, a = butter(5, channel_bandwidth )   
+b, a = butter(5, channel_bandwidth/nyq,btype='low')   
 rx = lfilter(b, a, signal)
 #rx=signal  #bypass bw limiting filter
 
@@ -57,109 +220,9 @@ rx += np.random.normal(0, noise_sigma, len(rx))
 # Matched filter on the recv'd signal
 matched = pulse[::-1]
 rx_mf = np.convolve(rx, matched, mode="same")
+rx_mf = rx_mf / np.std(rx_mf)
 
-def bandpass(low, high, fs, order=4):
-    nyq=fs/2
-    b, a = butter(order, [low/nyq, high/nyq], btype='bandpass')
-    return b, a
-
-def lms_equalizer(rx_mf, desired,eq_taps=7,mu=.001):
-    """
-    Least Mean Squares (LMS) equalizer
-
-    Parameters:
-        rx_mf   : array, matched-filtered received signal
-        desired : array, target signal (pulse-shaped + matched filter)
-        eq_taps : int, number of equalizer taps
-
-    """
-
-    rx_eq = np.zeros_like(rx_mf)
-
-    eq = np.zeros(eq_taps)
-    eq[eq_taps // 2] = 1.0  # identity initialization
-
-    for n in range(eq_taps, len(rx_mf)):
-        x = rx_mf[n-eq_taps+1:n+1][::-1]
-
-        y = eq@x
-        e = desired[n] - y
-        if np.isnan(e) or np.isnan(x).any():  # skip invalid updates
-            rx_eq[n] = y
-            continue
-        eq += mu * e * x
-        rx_eq[n] = y
-    return rx_eq,eq
-
-
-def rls_equalizer(rx_mf, desired, eq_taps=7, lambda_=0.999, delta=50.):
-    """
-    Recursive Least Squares (RLS) equalizer.
-
-    Parameters:
-        rx_mf   : array, matched-filtered received signal
-        desired : array, target signal (pulse-shaped + matched filter)
-        eq_taps : int, number of equalizer taps
-        lambda_ : float, forgetting factor (0 < lambda_ <= 1)
-        delta   : float, initial inverse correlation scaling
-
-    Returns:
-        rx_eq   : array, equalized output
-        eq      : array, final equalizer coefficients
-    """
-
-
-    eq = np.zeros(eq_taps)
-    eq[eq_taps // 2] = 1.0           # identity initialization
-    rx_eq = np.zeros_like(rx_mf)
-    P = np.eye(eq_taps) * delta       # inverse correlation matrix
-
-    for n in range(eq_taps, len(rx_mf)):
-
-        # input vector (most recent first)
-        x = rx_mf[n-eq_taps+1:n+1][::-1]
-
-        # filter output
-        y = eq @ x
-
-        # error between desired and output
-        e = desired[n] - y
-
-        # gain vector
-        Px = P @ x
-        K = Px / (lambda_ + x @ Px )
-
-        # update weights
-        eq = eq + K * e
-
-        # update inverse correlation matrix
-        P = (P - np.outer(K, Px)) / lambda_
-
-        # save output
-        rx_eq[n] = y
-
-    return rx_eq, eq
-
-# prepare desired:  upsample data and pulse-shape to match MF output
-tx_upsampled = np.zeros(len(data)*sps)
-tx_upsampled[::sps] = data
-desired = np.convolve(tx_upsampled, pulse, mode="same")
-desired = np.convolve(desired, matched, mode="same")
-
-rx_eq,eq=lms_equalizer(rx_mf,desired)
-
-#RLS with delta set by <power level>
-#print (np.var(rx_mf))
-#rx_eq,eq=rls_equalizer(rx_mf,desired,delta=np.var(rx_mf)*2)
-
-#RLS with clipping
-#rx_mf_norm = rx_mf / np.std(rx_mf)
-#desired_norm = desired / np.std(rx_mf)
-#rx_eq, eq = rls_equalizer(rx_mf_norm, desired_norm, delta=1.0,eq_taps=9)
-#rx_eq = np.clip(rx_eq, -np.max(np.abs(desired))*1.2, np.max(np.abs(desired))*1.2)
-
-
-def bestphase(rx_eq, sps=sps, num_symbols=num_symbols):
+def bestphase(rx, sps=sps, num_symbols=num_symbols):
     """
     determine optimum sampling phase
     """
@@ -169,36 +232,80 @@ def bestphase(rx_eq, sps=sps, num_symbols=num_symbols):
 
     for p in phases:
  
-        samples = rx_eq[p::sps][:num_symbols]
+        samples = rx[p::sps][:num_symbols]
     
         #metric[p] = np.var(samples)
         metric[p] = np.mean(np.abs(samples))
-
+        #metric[p] = np.mean(samples**2) / (np.var(samples) + 1e-12)  #7 fix
     
     return np.argmax(metric),phases,metric
 
 
+best_phase,phases,metric = bestphase(rx_mf)
+
+print("best sampling phase:", best_phase)
+
+samples = rx_mf[best_phase::sps][:num_symbols]
+
+
+# prepare desired:  upsample data and pulse-shape to match MF output
+tx_upsampled = np.zeros(len(data)*sps)
+tx_upsampled[::sps] = data
+desired = np.convolve(tx_upsampled, pulse, mode="same")
+desired = np.convolve(desired, matched, mode="same")
+desired = desired / np.std(desired)
+
+corr = np.correlate(rx_mf, desired, mode='full')
+
+lag = np.argmax(corr) - (len(desired) - 1)
+
+print("Estimated delay:", lag)
+
+if lag > 0:
+    desired = np.pad(desired, (lag, 0))[:len(desired)]
+else:
+    desired = np.pad(desired, (0, -lag))[-lag:]
+
+
+
+
+rx_eq, eq = rls_equalizer(rx_mf,desired,eq_taps=11 , lambda_=0.999, delta=1.0 / np.var(rx_mf) , sps=sps, best_phase=best_phase)
+
+#rx_eq, eq = lms_equalizer(rx_mf,desired,7,3e-3,sps,best_phase)
+
+# no equalizer
+#rx_eq=rx_mf
+
 best_phase,phases,metric = bestphase(rx_eq)
 
-print("Best sampling phase:", best_phase)
+sym_err = (desired - rx_eq)[best_phase::sps]
+plt.figure()
+plt.plot(sym_err**2)
+plt.title("symbol error power")
+plt.grid(True)
 
 
-
-print ("find baud-rate spectral line")
+print ("filter out the baud-rate component")
 
 sq = rx_eq**2
 sq = sq - np.mean(sq)
 
-b, a = bandpass(baud*0.8, baud*1.2, fs)
+b, a = bandpass(baud*0.8, baud*1.2, nyq)
 tone = filtfilt(b, a, sq)
 
 tone = tone / np.std(tone)
 
 print("run the PLL")
 
+def phase_cross(prev, curr, target):
+    d1 = (target - prev + np.pi) % (2*np.pi) - np.pi
+    d2 = (target - curr + np.pi) % (2*np.pi) - np.pi
+    return (d1 > 0) and (d2 <= 0)
+
 
 phase = 0
-freq = 2*np.pi*baud/fs*1.04
+prev_phase=phase
+freq = 2*np.pi*baud/fs*1.02
 integrator = 0
 
 phase_error = np.zeros_like(tone)
@@ -209,7 +316,11 @@ Kp = 0.02
 Ki = 0.0005
 
 phase_track = np.zeros_like(tone)
+phase_offset = 2 * np.pi * best_phase / sps
+target = (phase_offset + np.pi) % (2*np.pi) - np.pi
+strobe = np.zeros_like(tone)
 
+samples=[]
 for n in range(len(tone)):
 
     I = tone[n] * np.cos(phase)
@@ -223,19 +334,20 @@ for n in range(len(tone)):
     phase += freq + control
     phase = (phase + np.pi) % (2*np.pi) - np.pi
 
-    phase_track[n]=phase
 
+    if phase_cross(prev_phase, phase, target):
+        frac = (target - prev_phase) / (phase - prev_phase + 1e-12)
+        interp = rx_eq[n-1] + frac * (rx_eq[n] - rx_eq[n-1])
+        samples.append(interp)
+    
+    phase_track[n]=phase
+    prev_phase = phase
+    
     phase_error[n] = err
     freq_est[n] = (freq + control) * fs / (2*np.pi)
     nco[n] = np.cos(phase)
 
-
-    
-print("plot pulse shape")
-
-plt.figure(figsize=(4,2))
-plt.plot(pulse, 'r.')
-
+samples=np.array(samples)
 
 print("plot recv'd vs transmit (last 10000)")
 
@@ -313,7 +425,6 @@ fig.tight_layout(rect=[0, 0, 1, 0.96])
 print ("eye diagram")
 
 # diagram is eye_symbols wide
-eye_symbols = 2
 eye_samples = eye_symbols * sps
 
 # make a matrix out of stacked symbols, sps wide
@@ -337,13 +448,17 @@ plt.legend()
 
 print("calculate slice regions")
 
+
+###  we're trying to strobe this with PLL now
 # Sample at the best phase
-samples = rx_eq[best_phase::sps][:num_symbols]
+#samples = rx_eq[best_phase::sps][:num_symbols]
+
 
 # Estimate PAM4 levels using KMeans clustering
 from sklearn.cluster import KMeans
 init = levels.reshape(-1,1)
 kmeans = KMeans(n_clusters=4, init='k-means++', n_init=10, random_state=0)
+#kmeans = KMeans(n_clusters=4, init=init, n_init=1)
 
 samples_steady = samples[discard_symbols:]
 
@@ -366,7 +481,7 @@ sliced[samples >= thresholds[2]] = levels_rx[3]
 
 
 
-print ("compute SER")
+
 
 # map TX levels to indices
 level_map = { -3:0, -1:1, 1:2, 3:3 }
@@ -402,7 +517,7 @@ error_vector = (tx_valid != rx_valid)
 ser = np.mean(error_vector)
 
 
-#print(f"{ser=:.2%} errors {np.sum(error_vector)} of {len(error_vector)}")
+print(f"SER={ser:.2%} errors {np.sum(error_vector)} of {len(error_vector)}")
 
 
 print("plot symbol slices")
